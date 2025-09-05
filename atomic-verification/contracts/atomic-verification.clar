@@ -14,6 +14,8 @@
 (define-constant ERR_REPUTATION_TOO_LOW (err u11))
 (define-constant ERR_VERIFICATION_REQUEST_NOT_FOUND (err u12))
 (define-constant ERR_SKILL_ALREADY_EXISTS (err u13))
+(define-constant ERR_DEADLINE_PASSED (err u14))
+(define-constant ERR_INSUFFICIENT_BALANCE (err u15))
 
 ;; Data Variables
 (define-data-var contract-owner principal tx-sender)
@@ -31,7 +33,8 @@
         category: (string-ascii 32),
         decay-rate: uint,
         verification-threshold: uint,
-        is-active: bool
+        is-active: bool,
+        created-at: uint
     }
 )
 
@@ -99,6 +102,24 @@
     }
 )
 
+;; Private Functions
+(define-private (verify-merkle-path (proof-element (buff 32)) (current-hash (buff 32)))
+    (keccak256 (concat current-hash proof-element))
+)
+
+(define-private (calculate-reputation (user principal))
+    (match (map-get? user-reputation user)
+        reputation
+        (+ (get base-score reputation) 
+           (- (get verification-bonus reputation) (get stake-penalties reputation)))
+        (var-get base-reputation)
+    )
+)
+
+(define-private (is-skill-expired (skill-proof {commitment-hash: (buff 32), merkle-root: (buff 32), confidence-score: uint, last-verified: uint, verifier: principal, stake-amount: uint, proof-valid-until: uint}))
+    (> block-height (get proof-valid-until skill-proof))
+)
+
 ;; Owner Functions
 (define-public (set-contract-owner (new-owner principal))
     (begin
@@ -132,6 +153,17 @@
     )
 )
 
+(define-public (revoke-verifier (verifier principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+        (match (map-get? verifier-profiles verifier)
+            existing-profile (ok (map-set verifier-profiles verifier 
+                (merge existing-profile {is-approved: false})))
+            ERR_VERIFIER_NOT_FOUND
+        )
+    )
+)
+
 ;; Public Functions
 (define-public (register-skill (name (string-ascii 64)) (category (string-ascii 32)) (threshold uint))
     (let ((skill-id (+ (var-get skill-id-nonce) u1)))
@@ -144,7 +176,8 @@
             category: category,
             decay-rate: (var-get skill-decay-rate),
             verification-threshold: threshold,
-            is-active: true
+            is-active: true,
+            created-at: block-height
         })
         (var-set skill-id-nonce skill-id)
         (ok skill-id)
@@ -166,6 +199,10 @@
         (asserts! (and (>= confidence u1) (<= confidence u100)) ERR_INVALID_THRESHOLD)
         (asserts! (get is-active skill-info) ERR_INVALID_SKILL)
         (asserts! (not (is-eq commitment 0x00)) ERR_INVALID_COMMITMENT)
+        
+        ;; Check for duplicate verification
+        (asserts! (is-none (map-get? user-skill-proofs {user: tx-sender, skill-id: skill-id})) 
+                  ERR_DUPLICATE_VERIFICATION)
         
         (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
         
@@ -203,7 +240,7 @@
     (let ((request-id (+ (var-get verification-request-nonce) u1)))
         (asserts! (> (len skill-requirements) u0) ERR_INVALID_SKILL)
         (asserts! (and (>= confidence-threshold u1) (<= confidence-threshold u100)) ERR_INVALID_THRESHOLD)
-        (asserts! (> deadline block-height) ERR_INVALID_THRESHOLD)
+        (asserts! (> deadline block-height) ERR_DEADLINE_PASSED)
         (asserts! (> reward-amount u0) ERR_INVALID_THRESHOLD)
         
         (try! (stx-transfer? reward-amount tx-sender (as-contract tx-sender)))
@@ -243,6 +280,21 @@
             })
         )
         
+        ;; Update user reputation
+        (match (map-get? user-reputation user)
+            existing-rep (map-set user-reputation user 
+                (merge existing-rep {
+                    verification-bonus: (+ (get verification-bonus existing-rep) u10),
+                    last-updated: block-height
+                }))
+            (map-set user-reputation user {
+                base-score: (var-get base-reputation),
+                verification-bonus: u10,
+                stake-penalties: u0,
+                last-updated: block-height
+            })
+        )
+        
         (ok true)
     )
 )
@@ -278,6 +330,31 @@
     )
 )
 
+(define-public (withdraw-stake (skill-id uint))
+    (let (
+        (skill-proof (unwrap! (map-get? user-skill-proofs {user: tx-sender, skill-id: skill-id}) ERR_INVALID_PROOF))
+    )
+        (asserts! (> block-height (get proof-valid-until skill-proof)) ERR_SKILL_EXPIRED)
+        
+        (try! (as-contract (stx-transfer? (get stake-amount skill-proof) tx-sender tx-sender)))
+        
+        (map-delete user-skill-proofs {user: tx-sender, skill-id: skill-id})
+        (ok (get stake-amount skill-proof))
+    )
+)
+
+(define-public (deactivate-skill (skill-id uint))
+    (let (
+        (skill-info (unwrap! (map-get? skills skill-id) ERR_INVALID_SKILL))
+    )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+        
+        (map-set skills skill-id 
+            (merge skill-info {is-active: false}))
+        (ok true)
+    )
+)
+
 ;; Read-Only Functions
 (define-read-only (get-skill-info (skill-id uint))
     (map-get? skills skill-id)
@@ -287,4 +364,47 @@
     (map-get? user-skill-proofs {user: user, skill-id: skill-id})
 )
 
-(define-rea
+(define-read-only (get-verifier-profile (verifier principal))
+    (map-get? verifier-profiles verifier)
+)
+
+(define-read-only (get-verification-request (request-id uint))
+    (map-get? verification-requests request-id)
+)
+
+(define-read-only (get-skill-composition (skill-id uint))
+    (map-get? skill-compositions skill-id)
+)
+
+(define-read-only (get-user-reputation (user principal))
+    (calculate-reputation user)
+)
+
+(define-read-only (get-temporal-weight (skill-id uint) (time-period uint))
+    (map-get? temporal-skill-weights {skill-id: skill-id, time-period: time-period})
+)
+
+(define-read-only (get-contract-info)
+    {
+        owner: (var-get contract-owner),
+        skill-count: (var-get skill-id-nonce),
+        request-count: (var-get verification-request-nonce),
+        minimum-stake: (var-get minimum-stake),
+        decay-rate: (var-get skill-decay-rate),
+        base-reputation: (var-get base-reputation)
+    }
+)
+
+(define-read-only (is-skill-valid (user principal) (skill-id uint))
+    (match (map-get? user-skill-proofs {user: user, skill-id: skill-id})
+        skill-proof (not (is-skill-expired skill-proof))
+        false
+    )
+)
+
+(define-read-only (get-skill-confidence (user principal) (skill-id uint))
+    (match (map-get? user-skill-proofs {user: user, skill-id: skill-id})
+        skill-proof (some (get confidence-score skill-proof))
+        none
+    )
+)
